@@ -36,6 +36,10 @@ typedef int SP32;
 #define FALSE 0
 #endif
 
+#ifndef AFMT_S32_LE
+#define AFMT_S32_LE 0x00001000
+#endif
+
 /// Return code of adin_read()
 #define ADIN_EOF -1
 #define ADIN_ERROR -2
