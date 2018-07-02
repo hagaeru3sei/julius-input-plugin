@@ -117,7 +117,6 @@ static int freq;
 
 /* init microphone settings */
 static void init(void);
-//static void play(SP32);
 
 /**/
 static void init(void)
@@ -169,8 +168,7 @@ static void init(void)
   snd_pcm_hw_params_free(hw_params);
 
   if ((err = snd_pcm_prepare(input_handle)) < 0) {
-    fprintf(stderr, "cannot prepare audio interface for use (%s)\n",
-       snd_strerror(err));
+    fprintf(stderr, "cannot prepare audio interface for use (%s)\n", snd_strerror(err));
     exit(EXIT_FAILURE);
   }
 }
@@ -725,8 +723,8 @@ int adin_read(SP32 *buf, int sampnum)
     fprintf(stderr, "ERROR: Read from audio interface failed (%s)\n", snd_strerror (err));
     exit(EXIT_FAILURE);
   }
-  // 下位 13 ビットを切り捨てる.
-  *buf = (short)(*tmp_buffer >> 13);
+  // 下位 14 ビットを切り捨てる.
+  *buf = (*tmp_buffer >> 14);
   //fprintf(stdout, "input buffer: %d\n", *tmp_buffer);
   //fprintf(stdout, "outout buffer: %d\n", *buf);
   //play(buf);
@@ -736,7 +734,7 @@ int adin_read(SP32 *buf, int sampnum)
   //size &= ~1;
   //fprintf(stdout, "size: %d\n", size);
 
-  err /= sizeof(short);
+  err /= sizeof(int);
   //fprintf(stdout, "cnt: %d\n", err);
 
   return(err);
