@@ -61,10 +61,13 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <fcntl.h>
+#include <sent/stddefs.h>
+#include <sent/adin.h>
 #include <alsa/asoundlib.h>
 #include <sys/types.h>
 #include <sys/stat.h>
-#include <fcntl.h>
+#include <sys/ioctl.h>
 #include <sys/soundcard.h>
 #include "plugin_defs.h"
 
@@ -105,9 +108,11 @@
 /* sampling buffer size.  */
 #define BUF_SIZE  128
 
+/* Read timeout in msec. */
+#define MAXPOLLINTERVAL 300
+
 /**/
 static snd_pcm_t *input_handle;
-static snd_pcm_t *output_handle;
 
 /* S32_LE */
 static int tmp_buffer[BUF_SIZE * NUM_CHANNELS];
@@ -125,7 +130,7 @@ static void init(void)
   snd_pcm_hw_params_t *hw_params;
 
   // Open mic device
-  if ((err = snd_pcm_open(&input_handle, MIC_DEVICE, SND_PCM_STREAM_CAPTURE, 0)) < 0) {
+  if ((err = snd_pcm_open(&input_handle, MIC_DEVICE, SND_PCM_STREAM_CAPTURE, SND_PCM_NONBLOCK)) < 0) {
     fprintf(stderr, "cannot open audio device %s (%s)\n", MIC_DEVICE, snd_strerror(err));
     exit(EXIT_FAILURE);
   }
@@ -135,7 +140,7 @@ static void init(void)
     exit(EXIT_FAILURE);
   }
 
-  if ((err = snd_pcm_hw_params_any (input_handle, hw_params)) < 0) {
+  if ((err = snd_pcm_hw_params_any(input_handle, hw_params)) < 0) {
     fprintf(stderr, "cannot initialize hardware parameter structure (%s)\n", snd_strerror(err));
     exit(EXIT_FAILURE);
   }
@@ -172,23 +177,6 @@ static void init(void)
     exit(EXIT_FAILURE);
   }
 }
-
-/**/
-static void play(SP32 *buf) {
-  snd_pcm_sframes_t frames = snd_pcm_writei(output_handle, buf, BUF_SIZE);
-  // Check for errors
-  if (frames < 0) {
-    frames = snd_pcm_recover(output_handle, frames, 0);
-  }
-  if (frames < 0) {
-    fprintf(stderr, "ERROR: Failed writing audio with snd_pcm_writei(): %li\n", frames);
-    exit(EXIT_FAILURE);
-  }
-  if (frames > 0 && frames < BUF_SIZE) {
-    fprintf(stdout, "Short write (expected %d, wrote %li)\n", BUF_SIZE, frames);
-  }
-}
-
 
 /** 
  * <EN>
@@ -533,64 +521,9 @@ boolean adin_standby(int sfreq, void *dummy)
  */
 boolean adin_open(char *pathname)
 {
-  /* do open the device */
-  /*
-  int fmt;
-  int stereo;
-  int ret;
-  int s;
-  char buf[2];
-
-  if ((audio_fd = open(pathname ? pathname : "/dev/snd/pcmC0D0c", O_RDONLY)) == -1) {
-    printf("Error: cannot open %s\n", pathname ? pathname : "/dev/snd/pcmC0D0c");
-    return FALSE;
-  }
-  fmt = AFMT_S32_LE;
-  if (ioctl(audio_fd, SNDCTL_DSP_SETFMT, &fmt) == -1) {
-    printf("Error: failed set format to 16bit signed\n");
-    return FALSE;
-  }
-  stereo = 0;
-  ret = ioctl(audio_fd, SNDCTL_DSP_STEREO, &stereo);
-  if (ret == -1 || stereo != 0) {
-    stereo = 1;
-    ret = ioctl(audio_fd, SNDCTL_DSP_CHANNELS, &stereo);
-    if (ret == -1 || stereo != 1) {
-      printf("Error: failed to set monoral channel\n");
-      return FALSE;
-    }
-  }
-  s = freq;
-  if (ioctl(audio_fd, SNDCTL_DSP_SPEED, &s) == -1) {
-    printf("Erorr: failed to set sample rate to %dHz\n", freq);
-    return FALSE;
-  }
-  read(audio_fd, buf, 2);
-  */
-
   init();
 
-  // Open the PCM output
-  int err = snd_pcm_open(&output_handle, SPEAKER_DEVICE, SND_PCM_STREAM_PLAYBACK, 0);
-  if (err < 0) {
-    fprintf(stderr, "Play-back open error: %s\n", snd_strerror(err));
-    exit(EXIT_FAILURE);
-  }
-
-  // Configure parameters of PCM output
-  err = snd_pcm_set_params(output_handle,
-      SND_PCM_FORMAT_S32_LE,
-      SND_PCM_ACCESS_RW_INTERLEAVED,
-      NUM_CHANNELS,
-      SAMPLE_RATE,
-      1,         // Allow software resampling
-      50000);    // 0.05 seconds per buffer
-  if (err < 0) {
-    fprintf(stderr, "Play-back configuration error: %s\n", snd_strerror(err));
-    exit(EXIT_FAILURE);
-  }
-
-  return(TRUE);
+  return TRUE;
 }
 
 /**
@@ -695,49 +628,61 @@ boolean adin_open(char *pathname)
  * 返す．
  * </JA>
  */
-int adin_read(SP32 *buf, int sampnum)
+int adin_read(SP16 *buf, int sampnum)
 {
-  audio_buf_info info;
-  int size, cnt;
-  int err;
+  int cnt;
+  int ret;
+  snd_pcm_status_t *status;
+  int res;
+  struct timeval now, diff, tstamp;
 
-  /*
-  // get sample num that can be read without blocking
-  if (ioctl(audio_fd, SNDCTL_DSP_GETISPACE, &info) == -1) {
-    printf("Error: adin_sph0645lm4h_alsa: failed to get number of samples in the buffer\n");
-    return(ADIN_ERROR);
+  ret = snd_pcm_wait(handle, MAXPOLLINTERVAL);
+  switch (ret) {
+  case 0:      /* timeout */
+    fprintf(stderr, "Warning: adin_alsa: no data fragment after %d msec?\n", MAXPOLLINTERVAL);
+    cnt = 0;
+    break;
+  case 1:      /* has data */
+    cnt = snd_pcm_readi(handle, buf, sampnum); /* read available (non-block) */
+    break;
+  case -EPIPE: /* pipe error */
+    /* try to recover the broken pipe */
+    snd_pcm_status_alloca(&status);
+    if ((res = snd_pcm_status(handle, status)) < 0) {
+      fprintf(stderr, "Error: adin_alsa: broken pipe: status error (%s)\n", snd_strerror(res));
+      return -2;
+    }
+    if (snd_pcm_status_get_state(status) == SND_PCM_STATE_XRUN) {
+      gettimeofday(&now, 0);
+      snd_pcm_status_get_trigger_tstamp(status, &tstamp);
+      timersub(&now, &tstamp, &diff);
+      fprintf(stderr, "Warning: adin_alsa: overrun!!! (at least %.3f ms long)\n", diff.tv_sec * 1000 + diff.tv_usec / 1000.0);
+      if ((res = snd_pcm_prepare(handle)) < 0) {
+        fprintf(stderr, "Error: adin_alsa: overrun: prepare error (%s)", snd_strerror(res));
+        return -2;
+      }
+      break; /* ok, data should be accepted again */
+    } else if (snd_pcm_status_get_state(status) == SND_PCM_STATE_DRAINING) {
+      fprintf(stderr, "Warning: adin_alsa: draining: capture stream format change? attempting recover...\n");
+      if ((res = snd_pcm_prepare(handle)) < 0) {
+        fprintf(stderr, "Error: adin_alsa: draining: prepare error (%s)", snd_strerror(res));
+        return -2;
+      }
+      break;
+    }
+    fprintf(stderr, "Error: adin_alsa: error in snd_pcm_wait() (%s)\n", snd_pcm_state_name(snd_pcm_status_get_state(status)));
+    return -2;
+  default:     /* other poll error */
+    fprintf(stderr, "Error: adin_alsa: error in snd_pcm_wait() (%s)\n", snd_strerror(ret));
+    return(-2);			/* error */
   }
-  // get them as much as possible
-  size = sampnum * sizeof(SP32);
-  if (size > info.bytes) size = info.bytes;
-  size &= ~ 1; // Force 16bit alignment
-  cnt = read(audio_fd, buf, size);
-  if ( cnt < 0 ) {
-    printf("Error: adin_oss: failed to read samples\n");
-    return (ADIN_ERROR);
+
+  if (cnt < 0) {
+    fprintf(stderr, "Error: adin_alsa: failed to read PCM (%s)\n", snd_strerror(cnt));
+    return(-2);
   }
-  cnt /= sizeof(int);
-  */
-    
-  if ((err = snd_pcm_readi(input_handle, tmp_buffer, BUF_SIZE)) != BUF_SIZE) {
-    fprintf(stderr, "ERROR: Read from audio interface failed (%s)\n", snd_strerror (err));
-    exit(EXIT_FAILURE);
-  }
-  // 下位 14 ビットを切り捨てる.
-  *buf = (*tmp_buffer >> 14);
-  //fprintf(stdout, "input buffer: %d\n", *tmp_buffer);
-  //fprintf(stdout, "outout buffer: %d\n", *buf);
-  //play(buf);
 
-  //size = sampnum * sizeof(SP16);
-  //if (size > BUF_SIZE) size = BUF_SIZE;
-  //size &= ~1;
-  //fprintf(stdout, "size: %d\n", size);
-
-  err /= sizeof(int);
-  //fprintf(stdout, "cnt: %d\n", err);
-
-  return(err);
+  return cnt;
 }
 
 /**
@@ -778,7 +723,6 @@ int adin_read(SP32 *buf, int sampnum)
 boolean adin_close()
 {
   snd_pcm_close(input_handle);
-  snd_pcm_close(output_handle);
   return TRUE;
 }
 
