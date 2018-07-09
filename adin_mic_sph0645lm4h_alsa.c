@@ -97,16 +97,12 @@
 
 /* alsa dev */
 #define MIC_DEVICE "plughw:0,0"
-#define SPEAKER_DEVICE "plughw:0,0"
 
 /* sampling rate. select 16kHz or 48kHz */
 #define SAMPLE_RATE   16000
 
 /* mono channel */
 #define NUM_CHANNELS  1
-
-/* sampling buffer size.  */
-#define BUF_SIZE  128
 
 /* Read timeout in msec. */
 #define MAXPOLLINTERVAL 300
@@ -115,18 +111,89 @@
 static snd_pcm_t *input_handle;
 
 /* S32_LE */
-static int tmp_buffer[BUF_SIZE * NUM_CHANNELS];
+//static int tmp_buffer[SAMPLE_RATE * 2];
+static int tmp_buffer[256];
 
-/**/
+/**/;
 static int freq;
+
+/*  Lantency time in msec.  You can override this value by specifying environment valuable "LATENCY_MSEC". */
+static int latency = 32;
 
 /* init microphone settings */
 static void init(void);
 
-/**/
+/**
+ * Output detailed device information.
+ * 
+ * @param pcm_name [in] device name string
+ * @param handle [in] pcm audio handler
+ * 
+ */
+static void output_card_info(char *pcm_name, snd_pcm_t *handle)
+{
+  int err;
+  snd_ctl_t *ctl;
+  snd_ctl_card_info_t *info;
+  snd_pcm_info_t *pcminfo;
+  snd_ctl_card_info_alloca(&info);
+  snd_pcm_info_alloca(&pcminfo);
+  char ctlname[30];
+  int card;
+  
+  /* get PCM information to set current device and subdevice name */
+  if ((err = snd_pcm_info(handle, pcminfo)) < 0) {
+    fprintf(stderr, "Warning: adin_alsa: failed to obtain pcm info\n");
+    fprintf(stderr, "Warning: adin_alsa: skip output of detailed audio device info\n");
+    return;
+  }
+  /* open control associated with the pcm device name */
+  card = snd_pcm_info_get_card(pcminfo);
+  if (card < 0) {
+    strcpy(ctlname, "default");
+  } else {
+    snprintf(ctlname, 30, "hw:%d", card);
+  }
+  if ((err = snd_ctl_open(&ctl, ctlname, 0)) < 0) {
+    fprintf(stderr, "Warning: adin_alsa: failed to open control device \"%s\", \n", ctlname);
+    fprintf(stderr, "Warning: adin_alsa: skip output of detailed audio device info\n");
+    return;
+  }
+  /* get its card info */
+  if ((err = snd_ctl_card_info(ctl, info)) < 0) {
+    fprintf(stderr, "Warning: adin_alsa: unable to get card info for %s\n", ctlname);
+    fprintf(stderr, "Warning: adin_alsa: skip output of detailed audio device info\n");
+    snd_ctl_close(ctl);
+    return;
+  }
+
+  /* get detailed PCM information of current device from control */
+  if ((err = snd_ctl_pcm_info(ctl, pcminfo)) < 0) {
+    fprintf(stderr, "Error: adin_alsa: unable to get pcm info from card control\n");
+    fprintf(stderr, "Warning: adin_alsa: skip output of detailed audio device info\n");
+    snd_ctl_close(ctl);
+    return;
+  }
+  /* output */
+  fprintf(stdout, "Stat: \"%s\": %s [%s] device %s [%s] %s\n",
+       pcm_name,
+       snd_ctl_card_info_get_id(info),
+       snd_ctl_card_info_get_name(info),
+       snd_pcm_info_get_id(pcminfo),
+       snd_pcm_info_get_name(pcminfo),
+       snd_pcm_info_get_subdevice_name(pcminfo));
+
+  /* close controller */
+  snd_ctl_close(ctl);
+
+}
+
+/* */
 static void init(void)
 {
   int err;
+  int dir = 0;
+  unsigned int actual_rate;
   snd_pcm_hw_params_t *hw_params;
 
   // Open mic device
@@ -135,10 +202,15 @@ static void init(void)
     exit(EXIT_FAILURE);
   }
 
-  if ((err = snd_pcm_hw_params_malloc(&hw_params)) < 0) {
-    fprintf(stderr, "cannot allocate hardware parameter structure (%s)\n", snd_strerror(err));
+  /* set device to non-block mode */
+  if ((err = snd_pcm_nonblock(input_handle, 1)) < 0) {
+    fprintf(stderr, "Error: adin_alsa: cannot set PCM device to non-blocking mode\n");
     exit(EXIT_FAILURE);
   }
+
+  /* allocate hwparam structure */
+  snd_pcm_hw_params_alloca(&hw_params);
+
 
   if ((err = snd_pcm_hw_params_any(input_handle, hw_params)) < 0) {
     fprintf(stderr, "cannot initialize hardware parameter structure (%s)\n", snd_strerror(err));
@@ -165,13 +237,54 @@ static void init(void)
     exit(EXIT_FAILURE);
   }
 
+  /* set period size */
+  {
+    unsigned int period_time, period_time_current;
+    snd_pcm_uframes_t chunk_size;
+    boolean has_current_period;
+    boolean force = FALSE;
+    char *p;
+
+    /* set apropriate period size */
+    if ((p = getenv("LATENCY_MSEC")) != NULL) {
+      latency = atoi(p);
+      fprintf(stderr, "Stat: adin_alsa: trying to set latency to %d msec from LATENCY_MSEC)\n", latency);
+      force = TRUE;
+    }
+
+    /* get hardware max/min size */
+    has_current_period = TRUE;
+    if ((err = snd_pcm_hw_params_get_period_time(hw_params, &period_time_current, &dir)) < 0) {
+      has_current_period = FALSE;
+    }
+    if (has_current_period) {
+      fprintf(stderr, "Stat: adin_alsa: current latency time: %d msec\n", period_time_current / 1000);
+    }
+    
+    /* set period time (near value will be used) */
+    period_time = latency * 1000;
+    if (!force && has_current_period && period_time > period_time_current) {
+      fprintf(stdout, "Stat: adin_alsa: current latency (%dms) is shorter than %dms, leave it\n", period_time_current / 1000, latency);
+      period_time = period_time_current;
+    } else {
+      if ((err = snd_pcm_hw_params_set_period_time_near(input_handle, hw_params, &period_time, 0)) < 0) {
+        fprintf(stderr, "Error: adin_alsa: cannot set PCM record period time to %d msec (%s)\n", period_time / 1000, snd_strerror(err));
+        exit(EXIT_FAILURE);
+      }
+      snd_pcm_hw_params_get_period_size(hw_params, &chunk_size, 0);
+      fprintf(stdout, "Stat: adin_alsa: latency set to %d msec (chunk = %d bytes)\n", period_time / 1000, chunk_size);
+    }
+  }
+  
+  //snd_pcm_hw_params_free(hw_params);
+
+  /* apply the configuration to the PCM device */
   if ((err = snd_pcm_hw_params(input_handle, hw_params)) < 0) {
-    fprintf(stderr, "cannot set parameters (%s)\n", snd_strerror(err));
+    fprintf(stderr, "Error: adin_alsa: cannot set PCM hardware parameters (%s)\n", snd_strerror(err));
     exit(EXIT_FAILURE);
   }
 
-  snd_pcm_hw_params_free(hw_params);
-
+  /* prepare for recording */
   if ((err = snd_pcm_prepare(input_handle)) < 0) {
     fprintf(stderr, "cannot prepare audio interface for use (%s)\n", snd_strerror(err));
     exit(EXIT_FAILURE);
@@ -400,7 +513,7 @@ int adin_get_configuration(int opcode)
 
   /* typical values for live microphone/line input */
   switch(opcode) {
-  case 0:	
+  case 0:
     return 1;
   case 1:
     return 1;
@@ -410,7 +523,7 @@ int adin_get_configuration(int opcode)
   /* typical values for offline file input */
   /* 
    * switch(opcode) {
-   * case 0:	   
+   * case 0:   
    *   return 0;
    * case 1:
    *   return 0;
@@ -422,7 +535,7 @@ int adin_get_configuration(int opcode)
   /* assuming speech to be segmented at sender */
   /* 
    * switch(opcode) {
-   * case 0:	   
+   * case 0:   
    *   return 1;
    * case 1:
    *   return 0;
@@ -435,7 +548,7 @@ int adin_get_configuration(int opcode)
      should be done at Julius side */
   /* 
    * switch(opcode) {
-   * case 0:	   
+   * case 0:   
    *   return 1;
    * case 1:
    *   return 1;
@@ -444,6 +557,36 @@ int adin_get_configuration(int opcode)
    * }
    */
 }
+
+/** 
+ * Error recovery when PCM buffer underrun or suspend.
+ * 
+ * @param handle [in] audio handler
+ * @param err [in] error code
+ * 
+ * @return 0 on success, otherwise the given errno.
+ */
+static int xrun_recovery(snd_pcm_t *handle, int err)
+{ 
+  if (err == -EPIPE) {    /* under-run */
+    err = snd_pcm_prepare(handle);
+    if (err < 0)
+      fprintf(stderr, "Error: adin_alsa: can't recovery from PCM buffer underrun, prepare failed: %s\n", snd_strerror(err));
+    return 0;
+  } else if (err == -ESTRPIPE) {
+    while ((err = snd_pcm_resume(handle)) == -EAGAIN)
+      sleep(1);           /* wait until the suspend flag is released */
+    if (err < 0) {
+      err = snd_pcm_prepare(handle);
+      if (err < 0)
+        fprintf(stderr, "Error: adin_alsa: can't recovery from PCM buffer suspend, prepare failed: %s\n", snd_strerror(err));
+    }
+    return 0;
+  }
+  return err;
+}
+
+
  
 
 /************************************************************************/
@@ -521,7 +664,48 @@ boolean adin_standby(int sfreq, void *dummy)
  */
 boolean adin_open(char *pathname)
 {
+  int err;
+  snd_pcm_state_t status;
+
   init();
+
+  /* output status */
+  output_card_info(MIC_DEVICE, input_handle);
+
+  /* check hardware status */
+  while(1) {            /* wait till prepared */
+    status = snd_pcm_state(input_handle);
+    switch(status) {
+    case SND_PCM_STATE_PREPARED:    /* prepared for operation */
+      if ((err = snd_pcm_start(input_handle)) < 0) {
+        fprintf(stderr, "Error: adin_alsa: cannot start PCM (%s)\n", snd_strerror(err));
+        return FALSE;
+      }
+      return TRUE;
+      break;
+    case SND_PCM_STATE_RUNNING:     /* capturing the samples of other application */
+      if ((err = snd_pcm_drop(input_handle)) < 0) { /* discard the existing samples */
+        fprintf(stderr, "Error: adin_alsa: cannot drop PCM (%s)\n", snd_strerror(err));
+        return FALSE;
+      }
+      break;
+    case SND_PCM_STATE_XRUN:        /* buffer overrun */
+      if ((err = xrun_recovery(input_handle, -EPIPE)) < 0) {
+        fprintf(stderr, "Error: adin_alsa: PCM XRUN recovery failed (%s)\n", snd_strerror(err));
+        return FALSE;
+      }
+      break;
+    case SND_PCM_STATE_SUSPENDED:   /* suspended by power management system */
+      if ((err = xrun_recovery(input_handle, -ESTRPIPE)) < 0) {
+        fprintf(stderr, "Error: adin_alsa: PCM XRUN recovery failed (%s)\n", snd_strerror(err));
+        return FALSE;
+      }
+      break;
+    default:
+      /* do nothing */
+      break;
+    }
+  }
 
   return TRUE;
 }
@@ -636,19 +820,25 @@ int adin_read(SP16 *buf, int sampnum)
   int res;
   struct timeval now, diff, tstamp;
 
-  ret = snd_pcm_wait(handle, MAXPOLLINTERVAL);
+  ret = snd_pcm_wait(input_handle, MAXPOLLINTERVAL);
   switch (ret) {
   case 0:      /* timeout */
     fprintf(stderr, "Warning: adin_alsa: no data fragment after %d msec?\n", MAXPOLLINTERVAL);
     cnt = 0;
     break;
   case 1:      /* has data */
-    cnt = snd_pcm_readi(handle, buf, sampnum); /* read available (non-block) */
+    {
+      int idx;
+      cnt = snd_pcm_readi(input_handle, &tmp_buffer, 128); /* read available (non-block) */
+      for (idx=0; idx < 128; idx++) {
+        buf[idx] = (short)(tmp_buffer[idx] >> 14);
+      }
+    }
     break;
   case -EPIPE: /* pipe error */
     /* try to recover the broken pipe */
     snd_pcm_status_alloca(&status);
-    if ((res = snd_pcm_status(handle, status)) < 0) {
+    if ((res = snd_pcm_status(input_handle, status)) < 0) {
       fprintf(stderr, "Error: adin_alsa: broken pipe: status error (%s)\n", snd_strerror(res));
       return -2;
     }
@@ -657,14 +847,14 @@ int adin_read(SP16 *buf, int sampnum)
       snd_pcm_status_get_trigger_tstamp(status, &tstamp);
       timersub(&now, &tstamp, &diff);
       fprintf(stderr, "Warning: adin_alsa: overrun!!! (at least %.3f ms long)\n", diff.tv_sec * 1000 + diff.tv_usec / 1000.0);
-      if ((res = snd_pcm_prepare(handle)) < 0) {
+      if ((res = snd_pcm_prepare(input_handle)) < 0) {
         fprintf(stderr, "Error: adin_alsa: overrun: prepare error (%s)", snd_strerror(res));
         return -2;
       }
       break; /* ok, data should be accepted again */
     } else if (snd_pcm_status_get_state(status) == SND_PCM_STATE_DRAINING) {
       fprintf(stderr, "Warning: adin_alsa: draining: capture stream format change? attempting recover...\n");
-      if ((res = snd_pcm_prepare(handle)) < 0) {
+      if ((res = snd_pcm_prepare(input_handle)) < 0) {
         fprintf(stderr, "Error: adin_alsa: draining: prepare error (%s)", snd_strerror(res));
         return -2;
       }
@@ -674,7 +864,7 @@ int adin_read(SP16 *buf, int sampnum)
     return -2;
   default:     /* other poll error */
     fprintf(stderr, "Error: adin_alsa: error in snd_pcm_wait() (%s)\n", snd_strerror(ret));
-    return(-2);			/* error */
+    return(-2);/* error */
   }
 
   if (cnt < 0) {
