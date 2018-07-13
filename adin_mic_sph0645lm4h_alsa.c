@@ -112,7 +112,7 @@ static snd_pcm_t *input_handle;
 
 /* S32_LE */
 //static int tmp_buffer[SAMPLE_RATE * 2];
-static int tmp_buffer[256];
+static int tmp_buffer[128];
 
 /**/;
 static int freq;
