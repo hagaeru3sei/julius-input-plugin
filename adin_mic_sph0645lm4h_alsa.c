@@ -830,7 +830,7 @@ int adin_read(SP16 *buf, int sampnum)
     {
       int idx;
       cnt = snd_pcm_readi(input_handle, &tmp_buffer, 128); /* read available (non-block) */
-      for (idx=0; idx < 128; idx++) {
+      for (idx=0; idx < cnt; idx++) {
         buf[idx] = (short)(tmp_buffer[idx] >> 14);
       }
     }
