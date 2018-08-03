@@ -829,9 +829,18 @@ int adin_read(SP16 *buf, int sampnum)
   case 1:      /* has data */
     {
       int idx;
+      int tmp;
       cnt = snd_pcm_readi(input_handle, &tmp_buffer, 128); /* read available (non-block) */
-      for (idx=0; idx < cnt; idx++) {
-        buf[idx] = (short)(tmp_buffer[idx] >> 14);
+      for (idx=0; idx < 128; idx++) {
+        // Bit shift from 32 to 16 and then increase the volume with adjust zero point.
+        tmp = (tmp_buffer[idx] >> 12) + 10240;
+        if (tmp > 32767) {
+          buf[idx] = 32767;
+        } else if (tmp < -32768) {
+          buf[idx] = -32768;
+        } else {
+          buf[idx] = (short)tmp;
+        }
       }
     }
     break;
